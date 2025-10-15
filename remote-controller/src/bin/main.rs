@@ -8,6 +8,7 @@
 
 use defmt::info;
 use esp_hal::clock::CpuClock;
+use esp_hal::delay::Delay;
 use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_hal::rng::Rng;
 use esp_hal::time::Duration;
@@ -28,12 +29,29 @@ extern crate alloc;
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
 
+enum Actions {
+    Move,
+    Break,
+    Accel,
+    Halt,
+}
+
+fn action_to_msg(action: &Actions) -> &'static [u8] {
+    match action {
+        Actions::Move => b"Move",
+        Actions::Break => b"Break",
+        Actions::Accel => b"Accel",
+        Actions::Halt => b"Halt",
+    }
+}
+
 #[main]
 fn main() -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
     let mut led = Output::new(peripherals.GPIO2, Level::Low, OutputConfig::default());
     esp_alloc::heap_allocator!(size: 64 * 1024);
+    let actions = [Actions::Move, Actions::Break, Actions::Accel, Actions::Halt];
 
     info!("ESP-NOW Émetteur démarré");
     let timg0 = TimerGroup::new(peripherals.TIMG0);
@@ -55,10 +73,10 @@ fn main() -> ! {
 
     let mut robot_address: Option<[u8; 6]> = None;
     let mut next_discovery_broadcast = time::Instant::now();
+    let delay = Delay::new();
+    let mut action_index = 0;
 
     loop {
-        led.toggle();
-
         let r = esp_now.receive();
         if let Some(r) = r {
             let src = r.info.src_address;
@@ -73,11 +91,13 @@ fn main() -> ! {
             if dst != BROADCAST_ADDRESS && message_str == "CONNECTED" {
                 info!("Robot découvert !");
                 robot_address = Some(src);
+                led.toggle();
             }
 
             if dst == BROADCAST_ADDRESS && robot_address.is_none() {
                 info!("Robot découvert !");
                 robot_address = Some(src);
+                led.toggle();
 
                 if !esp_now.peer_exists(&src) {
                     esp_now
@@ -96,13 +116,27 @@ fn main() -> ! {
             }
         }
 
-        if robot_address.is_none() && time::Instant::now() >= next_discovery_broadcast {
-            next_discovery_broadcast = time::Instant::now() + Duration::from_secs(2);
-            let status = esp_now
-                .send(&BROADCAST_ADDRESS, b"CONTROLLER_PING")
-                .unwrap()
-                .wait();
-            info!("Broadcast envoyé: {:?}", status);
+        if robot_address.is_none() {
+            if time::Instant::now() >= next_discovery_broadcast {
+                next_discovery_broadcast = time::Instant::now() + Duration::from_secs(2);
+                let status = esp_now
+                    .send(&BROADCAST_ADDRESS, b"CONTROLLER_PING")
+                    .unwrap()
+                    .wait();
+                info!("Broadcast envoyé: {:?}", status.unwrap());
+            }
+        } else {
+            if action_index == actions.len() {
+                action_index = 0;
+            }
+
+            if let Some(address) = robot_address {
+                let _ = esp_now
+                    .send(&address, action_to_msg(&actions[action_index]))
+                    .unwrap();
+                action_index += 1;
+            }
+            delay.delay_millis(5000);
         }
     }
 }
